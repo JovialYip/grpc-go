@@ -28,6 +28,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -47,9 +48,9 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/testdata"
 
-	_ "google.golang.org/grpc/balancer/grpclb"      // Register the grpclb load balancing policy.
-	_ "google.golang.org/grpc/balancer/rls"         // Register the RLS load balancing policy.
-	_ "google.golang.org/grpc/xds/googledirectpath" // Register xDS resolver required for c2p directpath.
+	_ "google.golang.org/grpc/balancer/grpclb"    // Register the grpclb load balancing policy.
+	_ "google.golang.org/grpc/balancer/rls"       // Register the RLS load balancing policy.
+	"google.golang.org/grpc/xds/googledirectpath" // Register xDS resolver required for c2p directpath.
 
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 )
@@ -69,6 +70,7 @@ var (
 	serviceAccountKeyFile                  = flag.String("service_account_key_file", "", "Path to service account json key file")
 	oauthScope                             = flag.String("oauth_scope", "", "The scope for OAuth2 tokens")
 	defaultServiceAccount                  = flag.String("default_service_account", "", "Email of GCE default service account")
+	googleC2PUniverseDomain                = flag.String("google_c2p_universe_domain", "", "Universe domain for google-c2p resolve")
 	serverHost                             = flag.String("server_host", "localhost", "The server host name")
 	serverPort                             = flag.Int("server_port", 10000, "The server port number")
 	serviceConfigJSON                      = flag.String("service_config_json", "", "Disables service config lookups and sets the provided string as the default service config.")
@@ -79,6 +81,7 @@ var (
 	soakMinTimeMsBetweenRPCs               = flag.Int("soak_min_time_ms_between_rpcs", 0, "The minimum time in milliseconds between consecutive RPCs in a soak test (rpc_soak or channel_soak), useful for limiting QPS")
 	soakRequestSize                        = flag.Int("soak_request_size", 271828, "The request size in a soak RPC. The default value is set based on the interop large unary test case.")
 	soakResponseSize                       = flag.Int("soak_response_size", 314159, "The response size in a soak RPC. The default value is set based on the interop large unary test case.")
+	soakNumThreads                         = flag.Int("soak_num_threads", 1, "The number of threads for concurrent execution of the soak tests (rpc_soak or channel_soak). The default value is set based on the interop large unary test case.")
 	tlsServerName                          = flag.String("server_host_override", "", "The server name used to verify the hostname returned by TLS handshake if it is not empty. Otherwise, --server_host is used.")
 	additionalMetadata                     = flag.String("additional_metadata", "", "Additional metadata to send in each request, as a semicolon-separated list of key:value pairs.")
 	testCase                               = flag.String("test_case", "large_unary",
@@ -149,6 +152,21 @@ func parseAdditionalMetadataFlag() []string {
 	return addMd
 }
 
+// createSoakTestConfig creates a shared configuration structure for soak tests.
+func createBaseSoakConfig(serverAddr string) interop.SoakTestConfig {
+	return interop.SoakTestConfig{
+		RequestSize:                      *soakRequestSize,
+		ResponseSize:                     *soakResponseSize,
+		PerIterationMaxAcceptableLatency: time.Duration(*soakPerIterationMaxAcceptableLatencyMs) * time.Millisecond,
+		MinTimeBetweenRPCs:               time.Duration(*soakMinTimeMsBetweenRPCs) * time.Millisecond,
+		OverallTimeout:                   time.Duration(*soakOverallTimeoutSeconds) * time.Second,
+		ServerAddr:                       serverAddr,
+		NumWorkers:                       *soakNumThreads,
+		Iterations:                       *soakIterations,
+		MaxFailures:                      *soakMaxFailures,
+	}
+}
+
 func main() {
 	flag.Parse()
 	logger.Infof("Client running with test case %q", *testCase)
@@ -184,6 +202,11 @@ func main() {
 	}
 
 	resolver.SetDefaultScheme("dns")
+	if len(*googleC2PUniverseDomain) > 0 {
+		if err := googledirectpath.SetUniverseDomain(*googleC2PUniverseDomain); err != nil {
+			log.Fatalf("googlec2p.SetUniverseDomain(%s) failed: %v", *googleC2PUniverseDomain, err)
+		}
+	}
 	serverAddr := *serverHost
 	if *serverPort != 0 {
 		serverAddr = net.JoinHostPort(*serverHost, strconv.Itoa(*serverPort))
@@ -261,9 +284,9 @@ func main() {
 		}
 		opts = append(opts, grpc.WithUnaryInterceptor(unaryAddMd), grpc.WithStreamInterceptor(streamingAddMd))
 	}
-	conn, err := grpc.Dial(serverAddr, opts...)
+	conn, err := grpc.NewClient(serverAddr, opts...)
 	if err != nil {
-		logger.Fatalf("Fail to dial: %v", err)
+		logger.Fatalf("grpc.NewClient(%q) = %v", serverAddr, err)
 	}
 	defer conn.Close()
 	tc := testgrpc.NewTestServiceClient(conn)
@@ -358,10 +381,20 @@ func main() {
 		interop.DoPickFirstUnary(ctx, tc)
 		logger.Infoln("PickFirstUnary done")
 	case "rpc_soak":
-		interop.DoSoakTest(ctxWithDeadline, tc, serverAddr, opts, false /* resetChannel */, *soakIterations, *soakMaxFailures, *soakRequestSize, *soakResponseSize, time.Duration(*soakPerIterationMaxAcceptableLatencyMs)*time.Millisecond, time.Duration(*soakMinTimeMsBetweenRPCs)*time.Millisecond)
+		rpcSoakConfig := createBaseSoakConfig(serverAddr)
+		rpcSoakConfig.ChannelForTest = func() (*grpc.ClientConn, func()) { return conn, func() {} }
+		interop.DoSoakTest(ctxWithDeadline, rpcSoakConfig)
 		logger.Infoln("RpcSoak done")
 	case "channel_soak":
-		interop.DoSoakTest(ctxWithDeadline, tc, serverAddr, opts, true /* resetChannel */, *soakIterations, *soakMaxFailures, *soakRequestSize, *soakResponseSize, time.Duration(*soakPerIterationMaxAcceptableLatencyMs)*time.Millisecond, time.Duration(*soakMinTimeMsBetweenRPCs)*time.Millisecond)
+		channelSoakConfig := createBaseSoakConfig(serverAddr)
+		channelSoakConfig.ChannelForTest = func() (*grpc.ClientConn, func()) {
+			cc, err := grpc.NewClient(serverAddr, opts...)
+			if err != nil {
+				log.Fatalf("Failed to create shared channel: %v", err)
+			}
+			return cc, func() { cc.Close() }
+		}
+		interop.DoSoakTest(ctxWithDeadline, channelSoakConfig)
 		logger.Infoln("ChannelSoak done")
 	case "orca_per_rpc":
 		interop.DoORCAPerRPCTest(ctx, tc)

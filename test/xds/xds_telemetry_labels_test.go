@@ -46,7 +46,7 @@ const serviceNameValue = "grpc-service"
 const serviceNamespaceValue = "grpc-service-namespace"
 
 const localityKey = "grpc.lb.locality"
-const localityValue = `{"region":"region-1","zone":"zone-1","subZone":"subzone-1"}`
+const localityValue = `{region="region-1", zone="zone-1", sub_zone="subzone-1"}`
 
 // TestTelemetryLabels tests that telemetry labels from CDS make their way to
 // the stats handler. The stats handler sets the mutable context value that the
@@ -122,7 +122,7 @@ func (fsh *fakeStatsHandler) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) co
 	return ctx
 }
 
-func (fsh *fakeStatsHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
+func (fsh *fakeStatsHandler) HandleRPC(_ context.Context, rs stats.RPCStats) {
 	switch rs.(type) {
 	// stats.Begin won't get Telemetry Labels because happens after picker
 	// picks.

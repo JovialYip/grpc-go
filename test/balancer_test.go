@@ -154,6 +154,7 @@ func (s) TestCredsBundleFromBalancer(t *testing.T) {
 	te.tapHandle = authHandle
 	te.customDialOptions = []grpc.DialOption{
 		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, testBalancerName)),
+		grpc.WithAuthority("x.test.example.com"),
 	}
 	creds, err := credentials.NewServerTLSFromFile(testdata.Path("x509/server1_cert.pem"), testdata.Path("x509/server1_key.pem"))
 	if err != nil {
@@ -417,11 +418,15 @@ func (s) TestAddressAttributesInNewSubConn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	s := grpc.NewServer()
-	testgrpc.RegisterTestServiceServer(s, &testServer{})
-	go s.Serve(lis)
-	defer s.Stop()
+	stub := &stubserver.StubServer{
+		Listener: lis,
+		EmptyCallF: func(_ context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
+			return &testpb.Empty{}, nil
+		},
+		S: grpc.NewServer(),
+	}
+	stubserver.StartTestService(t, stub)
+	defer stub.S.Stop()
 	t.Logf("Started gRPC server at %s...", lis.Addr().String())
 
 	creds := &attrTransportCreds{}
@@ -548,15 +553,16 @@ func (s) TestServersSwap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error while listening. Err: %v", err)
 		}
-		s := grpc.NewServer()
-		ts := &funcServer{
-			unaryCall: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+
+		stub := &stubserver.StubServer{
+			Listener: lis,
+			UnaryCallF: func(_ context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 				return &testpb.SimpleResponse{Username: username}, nil
 			},
+			S: grpc.NewServer(),
 		}
-		testgrpc.RegisterTestServiceServer(s, ts)
-		go s.Serve(lis)
-		return lis.Addr().String(), s.Stop
+		stubserver.StartTestService(t, stub)
+		return lis.Addr().String(), stub.S.Stop
 	}
 	const one = "1"
 	addr1, cleanup := reg(one)
@@ -568,7 +574,7 @@ func (s) TestServersSwap(t *testing.T) {
 	// Initialize client
 	r := manual.NewBuilderWithScheme("whatever")
 	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: addr1}}})
-	cc, err := grpc.DialContext(ctx, r.Scheme()+":///", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
 	if err != nil {
 		t.Fatalf("Error creating client: %v", err)
 	}
@@ -603,29 +609,30 @@ func (s) TestWaitForReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
 	}
-	s := grpc.NewServer()
-	defer s.Stop()
 	const one = "1"
-	ts := &funcServer{
-		unaryCall: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+	stub := &stubserver.StubServer{
+		Listener: lis,
+		UnaryCallF: func(_ context.Context, _ *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 			return &testpb.SimpleResponse{Username: one}, nil
 		},
+		S: grpc.NewServer(),
 	}
-	testgrpc.RegisterTestServiceServer(s, ts)
-	go s.Serve(lis)
+	stubserver.StartTestService(t, stub)
+	defer stub.S.Stop()
 
 	// Initialize client
 	r := manual.NewBuilderWithScheme("whatever")
 
-	cc, err := grpc.DialContext(ctx, r.Scheme()+":///", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(r))
 	if err != nil {
 		t.Fatalf("Error creating client: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 	client := testgrpc.NewTestServiceClient(cc)
 
 	// Report an error so non-WFR RPCs will give up early.
-	r.CC.ReportError(errors.New("fake resolver error"))
+	r.CC().ReportError(errors.New("fake resolver error"))
 
 	// Ensure the client is not connected to anything and fails non-WFR RPCs.
 	if res, err := client.UnaryCall(ctx, &testpb.SimpleRequest{}); status.Code(err) != codes.Unavailable {
@@ -740,10 +747,15 @@ func (s) TestAuthorityInBuildOptions(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			s := grpc.NewServer()
-			testgrpc.RegisterTestServiceServer(s, &testServer{})
-			go s.Serve(lis)
-			defer s.Stop()
+			stub := &stubserver.StubServer{
+				Listener: lis,
+				EmptyCallF: func(_ context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
+					return &testpb.Empty{}, nil
+				},
+				S: grpc.NewServer(),
+			}
+			stubserver.StartTestService(t, stub)
+			defer stub.S.Stop()
 			t.Logf("Started gRPC server at %s...", lis.Addr().String())
 
 			r := manual.NewBuilderWithScheme("whatever")
@@ -848,14 +860,13 @@ func (s) TestMetadataInPickResult(t *testing.T) {
 	stub.Register(t.Name(), stub.BalancerFuncs{
 		Init: func(bd *stub.BalancerData) {
 			cc := &testCCWrapper{ClientConn: bd.ClientConn}
-			bd.Data = balancer.Get(pickfirst.Name).Build(cc, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(pickfirst.Name).Build(cc, bd.BuildOptions)
 		},
 		Close: func(bd *stub.BalancerData) {
-			bd.Data.(balancer.Balancer).Close()
+			bd.ChildBalancer.Close()
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			bal := bd.Data.(balancer.Balancer)
-			return bal.UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 	})
 
@@ -1014,16 +1025,16 @@ func (s) TestSubConn_RegisterHealthListener(t *testing.T) {
 				ClientConn: cc,
 				scChan:     scChan,
 			}
-			bd.Data = balancer.Get(pickfirst.Name).Build(ccw, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(pickfirst.Name).Build(ccw, bd.BuildOptions)
 		},
 		Close: func(bd *stub.BalancerData) {
-			bd.Data.(balancer.Balancer).Close()
+			bd.ChildBalancer.Close()
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			return bd.Data.(balancer.Balancer).UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 		ExitIdle: func(bd *stub.BalancerData) {
-			bd.Data.(balancer.ExitIdler).ExitIdle()
+			bd.ChildBalancer.ExitIdle()
 		},
 	}
 
@@ -1125,13 +1136,13 @@ func (s) TestSubConn_RegisterHealthListener_RegisterTwice(t *testing.T) {
 					}
 				},
 			}
-			bd.Data = balancer.Get(pickfirst.Name).Build(ccw, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(pickfirst.Name).Build(ccw, bd.BuildOptions)
 		},
 		Close: func(bd *stub.BalancerData) {
-			bd.Data.(balancer.Balancer).Close()
+			bd.ChildBalancer.Close()
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			return bd.Data.(balancer.Balancer).UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 	}
 
@@ -1221,13 +1232,13 @@ func (s) TestSubConn_RegisterHealthListener_NilListener(t *testing.T) {
 					}
 				},
 			}
-			bd.Data = balancer.Get(pickfirst.Name).Build(ccw, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(pickfirst.Name).Build(ccw, bd.BuildOptions)
 		},
 		Close: func(bd *stub.BalancerData) {
-			bd.Data.(balancer.Balancer).Close()
+			bd.ChildBalancer.Close()
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			return bd.Data.(balancer.Balancer).UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 	}
 

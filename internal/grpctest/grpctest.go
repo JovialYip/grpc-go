@@ -20,6 +20,7 @@
 package grpctest
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -52,25 +53,29 @@ type Tester struct{}
 
 // Setup updates the tlogger.
 func (Tester) Setup(t *testing.T) {
-	TLogger.Update(t)
+	tLogr.update(t)
 	// TODO: There is one final leak around closing connections without completely
 	//  draining the recvBuffer that has yet to be resolved. All other leaks have been
 	//  completely addressed, and this can be turned back on as soon as this issue is
 	//  fixed.
 	leakcheck.SetTrackingBufferPool(logger{t: t})
+	leakcheck.TrackTimers()
 }
 
 // Teardown performs a leak check.
 func (Tester) Teardown(t *testing.T) {
 	leakcheck.CheckTrackingBufferPool()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	leakcheck.CheckTimers(ctx, logger{t: t})
 	if atomic.LoadUint32(&lcFailed) == 1 {
 		return
 	}
-	leakcheck.CheckGoroutines(logger{t: t}, 10*time.Second)
+	leakcheck.CheckGoroutines(ctx, logger{t: t})
 	if atomic.LoadUint32(&lcFailed) == 1 {
 		t.Log("Goroutine leak check disabled for future tests")
 	}
-	TLogger.EndTest(t)
+	tLogr.endTest(t)
 }
 
 // Interface defines Tester's methods for use in this package.

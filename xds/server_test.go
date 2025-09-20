@@ -42,13 +42,13 @@ import (
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
 	"google.golang.org/grpc/internal/xds/bootstrap"
-	"google.golang.org/grpc/xds/internal/xdsclient"
-	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource/version"
+	"google.golang.org/grpc/internal/xds/xdsclient"
+	"google.golang.org/grpc/internal/xds/xdsclient/xdsresource/version"
 
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	v3discoverypb "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 
-	_ "google.golang.org/grpc/xds/internal/httpfilter/router" // Register the router filter
+	_ "google.golang.org/grpc/internal/xds/httpfilter/router" // Register the router filter
 )
 
 const (
@@ -177,14 +177,14 @@ func (s) TestNewServer_Failure(t *testing.T) {
 	}{
 		{
 			desc:       "bootstrap env var not set",
-			serverOpts: []grpc.ServerOption{grpc.Creds(xdsCreds)},
-			wantErr:    "failed to get xDS bootstrap config",
+			serverOpts: []grpc.ServerOption{grpc.Creds(xdsCreds), BootstrapContentsForTesting(nil)},
+			wantErr:    "failed to read xDS bootstrap config from env vars",
 		},
 		{
 			desc: "empty bootstrap config",
 			serverOpts: []grpc.ServerOption{
 				grpc.Creds(xdsCreds),
-				BootstrapContentsForTesting([]byte(`{}`)),
+				BootstrapContentsForTesting(nil),
 			},
 			wantErr: "xDS client creation failed",
 		},
@@ -474,11 +474,9 @@ func (s) TestServeSuccess(t *testing.T) {
 // TestNewServer_ClientCreationFailure tests the case where the xDS client
 // creation fails and verifies that the call to NewGRPCServer() fails.
 func (s) TestNewServer_ClientCreationFailure(t *testing.T) {
-	origNewXDSClient := newXDSClient
-	newXDSClient = func(string) (xdsclient.XDSClient, func(), error) {
-		return nil, nil, errors.New("xdsClient creation failed")
-	}
-	defer func() { newXDSClient = origNewXDSClient }()
+	origXDSClientPool := xdsClientPool
+	xdsClientPool = xdsclient.NewPool(nil)
+	defer func() { xdsClientPool = origXDSClientPool }()
 
 	if _, err := NewGRPCServer(); err == nil {
 		t.Fatal("NewGRPCServer() succeeded when expected to fail")
@@ -608,8 +606,11 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	// configuration to be used during xDS client creation.
 	modeChangeCh := testutils.NewChannel()
 	modeChangeOption := ServingModeCallback(func(addr net.Addr, args ServingModeChangeArgs) {
+		// The serving mode callback may be invoked multiple times as the xDS
+		// client NACKs the updates and the management server responds back with
+		// the same version of the LDS resource.
 		t.Logf("Server mode change callback invoked for listener %q with mode %q and error %v", addr.String(), args.Mode, args.Err)
-		modeChangeCh.Send(args.Mode)
+		modeChangeCh.Replace(args.Mode)
 	})
 	server, err := NewGRPCServer(modeChangeOption, BootstrapContentsForTesting(bootstrapContents))
 	if err != nil {
@@ -657,15 +658,15 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Also make sure that no serving mode updates are received. The serving
-	// mode does not change until the server comes to the conclusion that the
-	// requested resource is not present in the management server. This happens
-	// when the watch timer expires or when the resource is explicitly deleted
-	// by the management server.
-	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := modeChangeCh.Receive(sCtx); err != context.DeadlineExceeded {
-		t.Fatal("Serving mode changed received when none expected")
+	// Also make sure that serving mode updates are received. The serving
+	// mode changes to NOT_SERVING. This happens because watcher received a
+	// resource error for the invalid resource from the server.
+	mode, err := modeChangeCh.Receive(ctx)
+	if err == context.DeadlineExceeded {
+		t.Fatal("Serving mode did not change when expected to change")
+	}
+	if mode != connectivity.ServingModeNotServing {
+		t.Fatalf("Serving mode = %q, want %q", mode, connectivity.ServingModeNotServing)
 	}
 }
 
@@ -699,10 +700,22 @@ func (s) TestServeAndCloseDoNotRace(t *testing.T) {
 	// Generate bootstrap contents up front for all servers.
 	bootstrapContents := generateBootstrapContents(t, uuid.NewString(), nonExistentManagementServer)
 
+	// Override the default ServingModeCallback with a noop function because the
+	// serverURI is invalid which will result in xDS channel creation failure
+	// while registering the watch for listener resource. This will trigger
+	// resource error notifications for the invalid listener resource leading
+	// to service mode change to "not serving" each time.
+	//
+	// Even if the server is currently NOT_SERVING and the new mode is also
+	// NOT_SERVING, the update is not suppressed as:
+	//   1. the error may have change
+	//   2. it provides a timestamp of the last backoff attempt
+	noopModeChangeCallback := func(_ net.Addr, _ ServingModeChangeArgs) {}
+
 	wg := sync.WaitGroup{}
 	wg.Add(200)
 	for i := 0; i < 100; i++ {
-		server, err := NewGRPCServer(BootstrapContentsForTesting(bootstrapContents))
+		server, err := NewGRPCServer(BootstrapContentsForTesting(bootstrapContents), ServingModeCallback(noopModeChangeCallback))
 		if err != nil {
 			t.Fatalf("Failed to create an xDS enabled gRPC server: %v", err)
 		}

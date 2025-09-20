@@ -49,7 +49,7 @@ git grep 'func [A-Z]' -- "*_test.go" | not grep -v 'func Test\|Benchmark\|Exampl
 
 # - Do not use time.After except in tests.  It has the potential to leak the
 #   timer since there is no way to stop it early.
-git grep -l 'time.After(' -- "*.go" | not grep -v '_test.go\|test_utils\|testutils'
+git grep -l 'time.After(' -- "*.go" | not grep -v '_test.go\|soak_tests\|testutils'
 
 # - Do not use "interface{}"; use "any" instead.
 git grep -l 'interface{}' -- "*.go" 2>&1 | not grep -v '\.pb\.go\|protoc-gen-go-grpc\|grpc_testing_not_regenerated'
@@ -64,29 +64,29 @@ not git grep "\"github.com/golang/protobuf/*" -- "*.go" ':(exclude)testdata/grpc
 not git grep "\(import \|^\s*\)\"google.golang.org/grpc/interop/grpc_testing" -- "*.go"
 
 # - Ensure that no trailing spaces are found.
-not git grep '[[:blank:]]$'
+not git grep -n '[[:blank:]]$'
 
 # - Ensure that all files have a terminating newline.
 git ls-files | not xargs -I {} sh -c '[ -n "$(tail -c 1 "{}" 2>/dev/null)" ] && echo "{}: No terminating new line found"' | fail_on_output
 
 # - Ensure that no tabs are found in markdown files.
-not git grep $'\t' -- '*.md'
+not git grep -n $'\t' -- '*.md'
 
 # - Ensure all xds proto imports are renamed to *pb or *grpc.
 git grep '"github.com/envoyproxy/go-control-plane/envoy' -- '*.go' ':(exclude)*.pb.go' | not grep -v 'pb "\|grpc "'
 
 # - Ensure all context usages are done with timeout.
 # Context tests under benchmark are excluded as they are testing the performance of context.Background() and context.TODO().
-# TODO: Remove the exclusions once the tests are updated to use context.WithTimeout().
-# See https://github.com/grpc/grpc-go/issues/7304
-git grep -e 'context.Background()' --or -e 'context.TODO()' -- "*_test.go" | grep -v "benchmark/primitives/context_test.go" | grep -v "credential
-s/google" | grep -v "internal/transport/" | grep -v "xds/internal/" | grep -v "security/advancedtls" | grep -v 'context.WithTimeout(' | not grep -v 'context.WithCancel('
+git grep -e 'context.Background()' --or -e 'context.TODO()' -- "*_test.go" | grep -v "benchmark/primitives/context_test.go" | grep -v 'context.WithTimeout(' | not grep -v 'context.WithCancel('
 
 # Disallow usage of net.ParseIP in favour of netip.ParseAddr as the former
 # can't parse link local IPv6 addresses.
 not git grep 'net.ParseIP' -- '*.go'
 
 misspell -error .
+
+# Get the absolute path to revive.toml relative to the script location
+REVIVE_CONFIG_PATH="$(dirname "$(realpath "$0")")/revive.toml"
 
 # - gofmt, goimports, go vet, go mod tidy.
 # Perform these checks on each module inside gRPC.
@@ -97,9 +97,18 @@ for MOD_FILE in $(find . -name 'go.mod'); do
   gofmt -s -d -l . 2>&1 | fail_on_output
   goimports -l . 2>&1 | not grep -vE "\.pb\.go"
 
-  go mod tidy -compat=1.22
+  go mod tidy -compat=1.24
   git status --porcelain 2>&1 | fail_on_output || \
     (git status; git --no-pager diff; exit 1)
+
+  # Error for violation of enabled lint rules in config excluding generated code.
+  revive \
+    -set_exit_status=1 \
+    -exclude "testdata/grpc_testing_not_regenerated/" \
+    -exclude "**/*.pb.go" \
+    -formatter plain \
+    -config "${REVIVE_CONFIG_PATH}" \
+    ./...
 
   # - Collection of static analysis checks
   SC_OUT="$(mktemp)"
@@ -162,12 +171,16 @@ XXXXX gRPC internal usage deprecation errors:
 : v1alphareflectionpb.
 BalancerAttributes is deprecated:
 CredsBundle is deprecated:
+GetMetadata is deprecated:
 internal.Logger is deprecated:
 Metadata is deprecated: use Attributes instead.
+NewAddress is deprecated:
 NewSubConn is deprecated:
 OverrideServerName is deprecated:
 RemoveSubConn is deprecated:
 SecurityVersion is deprecated:
+.ServerName is deprecated:
+stats.PickerUpdated is deprecated:
 Target is deprecated: Use the Target field in the BuildOptions instead.
 UpdateAddresses is deprecated:
 UpdateSubConnState is deprecated:
@@ -190,14 +203,5 @@ GetValidationContextCertificateProviderInstance
 XXXXX PleaseIgnoreUnused'
   popd
 done
-
-# Error for violation of enabled lint rules in config excluding generated code.
-revive \
-  -set_exit_status=1 \
-  -exclude "testdata/grpc_testing_not_regenerated/" \
-  -exclude "**/*.pb.go" \
-  -formatter plain \
-  -config "$(dirname "$0")/revive.toml" \
-  ./...
 
 echo SUCCESS

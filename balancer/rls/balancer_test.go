@@ -333,11 +333,12 @@ func (s) TestConfigUpdate_ChildPolicyConfigs(t *testing.T) {
 	// Register a manual resolver and push the RLS service config through it.
 	r := startManualResolverWithConfig(t, rlsConfig)
 
-	cc, err := grpc.Dial(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	// At this point, the RLS LB policy should have received its config, and
 	// should have created a child policy for the default target.
@@ -448,11 +449,12 @@ func (s) TestConfigUpdate_ChildPolicyChange(t *testing.T) {
 	// Register a manual resolver and push the RLS service config through it.
 	r := startManualResolverWithConfig(t, rlsConfig)
 
-	cc, err := grpc.Dial(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	// At this point, the RLS LB policy should have received its config, and
 	// should have created a child policy for the default target.
@@ -603,11 +605,12 @@ func (s) TestConfigUpdate_DataCacheSizeDecrease(t *testing.T) {
 	// Register a manual resolver and push the RLS service config through it.
 	r := startManualResolverWithConfig(t, rlsConfig)
 
-	cc, err := grpc.Dial(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	<-clientConnUpdateDone
 
@@ -686,19 +689,17 @@ func (s) TestPickerUpdateOnDataCacheSizeDecrease(t *testing.T) {
 	stub.Register(topLevelBalancerName, stub.BalancerFuncs{
 		Init: func(bd *stub.BalancerData) {
 			ccWrapper = &testCCWrapper{ClientConn: bd.ClientConn}
-			bd.Data = balancer.Get(Name).Build(ccWrapper, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(Name).Build(ccWrapper, bd.BuildOptions)
 		},
 		ParseConfig: func(sc json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
 			parser := balancer.Get(Name).(balancer.ConfigParser)
 			return parser.ParseConfig(sc)
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			bal := bd.Data.(balancer.Balancer)
-			return bal.UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 		Close: func(bd *stub.BalancerData) {
-			bal := bd.Data.(balancer.Balancer)
-			bal.Close()
+			bd.ChildBalancer.Close()
 		},
 	})
 
@@ -769,11 +770,12 @@ func (s) TestPickerUpdateOnDataCacheSizeDecrease(t *testing.T) {
 	sc := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(scJSON)
 	r.InitialState(resolver.State{ServiceConfig: sc})
 
-	cc, err := grpc.Dial(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("create grpc.Dial() failed: %v", err)
+		t.Fatalf("create grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	<-clientConnUpdateDone
 
@@ -1066,19 +1068,17 @@ func (s) TestUpdateStatePauses(t *testing.T) {
 	stub.Register(topLevelBalancerName, stub.BalancerFuncs{
 		Init: func(bd *stub.BalancerData) {
 			ccWrapper = &testCCWrapper{ClientConn: bd.ClientConn}
-			bd.Data = balancer.Get(Name).Build(ccWrapper, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(Name).Build(ccWrapper, bd.BuildOptions)
 		},
 		ParseConfig: func(sc json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
 			parser := balancer.Get(Name).(balancer.ConfigParser)
 			return parser.ParseConfig(sc)
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			bal := bd.Data.(balancer.Balancer)
-			return bal.UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 		Close: func(bd *stub.BalancerData) {
-			bal := bd.Data.(balancer.Balancer)
-			bal.Close()
+			bd.ChildBalancer.Close()
 		},
 	})
 
@@ -1094,10 +1094,10 @@ func (s) TestUpdateStatePauses(t *testing.T) {
 	}
 	stub.Register(childPolicyName, stub.BalancerFuncs{
 		Init: func(bd *stub.BalancerData) {
-			bd.Data = balancer.Get(pickfirst.Name).Build(bd.ClientConn, bd.BuildOptions)
+			bd.ChildBalancer = balancer.Get(pickfirst.Name).Build(bd.ClientConn, bd.BuildOptions)
 		},
 		Close: func(bd *stub.BalancerData) {
-			bd.Data.(balancer.Balancer).Close()
+			bd.ChildBalancer.Close()
 		},
 		ParseConfig: func(sc json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
 			cfg := &childPolicyConfig{}
@@ -1107,7 +1107,7 @@ func (s) TestUpdateStatePauses(t *testing.T) {
 			return cfg, nil
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			bal := bd.Data.(balancer.Balancer)
+			bal := bd.ChildBalancer
 			bd.ClientConn.UpdateState(balancer.State{ConnectivityState: connectivity.Idle, Picker: &testutils.TestConstPicker{Err: balancer.ErrNoSubConnAvailable}})
 			bd.ClientConn.UpdateState(balancer.State{ConnectivityState: connectivity.Connecting, Picker: &testutils.TestConstPicker{Err: balancer.ErrNoSubConnAvailable}})
 
@@ -1151,11 +1151,12 @@ func (s) TestUpdateStatePauses(t *testing.T) {
 	sc := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(scJSON)
 	r.InitialState(resolver.State{ServiceConfig: sc})
 
-	cc, err := grpc.Dial(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(r.Scheme()+":///", grpc.WithResolvers(r), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	// Wait for the clientconn update to be processed by the RLS LB policy.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)

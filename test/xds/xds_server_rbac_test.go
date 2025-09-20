@@ -33,12 +33,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/authz/audit"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
 	"google.golang.org/grpc/internal/testutils/xds/e2e/setup"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/xds"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -245,9 +246,9 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cc, err := grpc.DialContext(ctx, fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
+	cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 	if err != nil {
-		t.Fatalf("failed to dial local test server: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 
@@ -265,8 +266,12 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 	// This Unary Call should match to a route with an incorrect action. Thus,
 	// this RPC should not go through as per A36, and this call should receive
 	// an error with codes.Unavailable.
-	if _, err = client.UnaryCall(ctx, &testpb.SimpleRequest{}); status.Code(err) != codes.Unavailable {
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
+	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("client.UnaryCall() = _, %v, want _, error code %s", err, codes.Unavailable)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("client.UnaryCall() = %v, want xDS node id %q", err, nodeID)
 	}
 
 	// This Streaming Call should match to a route with an incorrect action.
@@ -276,8 +281,13 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamingInputCall(_) = _, %v, want <nil>", err)
 	}
-	if _, err = stream.CloseAndRecv(); status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "the incoming RPC matched to a route that was not of action type non forwarding") {
-		t.Fatalf("streaming RPC should have been denied")
+	_, err = stream.CloseAndRecv()
+	const wantStreamingErr = "the incoming RPC matched to a route that was not of action type non forwarding"
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), wantStreamingErr) {
+		t.Fatalf("client.StreamingInputCall() = %v, want error with code %s and message %q", err, codes.Unavailable, wantStreamingErr)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("client.StreamingInputCall() = %v, want xDS node id %q", err, nodeID)
 	}
 
 	// This Full Duplex should not match to a route, and thus should return an
@@ -286,8 +296,13 @@ func (s) TestServerSideXDS_RouteConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FullDuplexCall(_) = _, %v, want <nil>", err)
 	}
-	if _, err = dStream.Recv(); status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "the incoming RPC did not match a configured Route") {
-		t.Fatalf("streaming RPC should have been denied")
+	_, err = dStream.Recv()
+	const wantFullDuplexErr = "the incoming RPC did not match a configured Route"
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), wantFullDuplexErr) {
+		t.Fatalf("client.FullDuplexCall() = %v, want error with code %s and message %q", err, codes.Unavailable, wantFullDuplexErr)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("client.FullDuplexCall() = %v, want xDS node id %q", err, nodeID)
 	}
 }
 
@@ -402,8 +417,6 @@ func serverListenerWithRBACHTTPFilters(t *testing.T, host string, port uint32, r
 // as normal and certain RPC's are denied by the RBAC HTTP Filter which gets
 // called by hooked xds interceptors.
 func (s) TestRBACHTTPFilter(t *testing.T) {
-	internal.RegisterRBACHTTPFilterForTesting()
-	defer internal.UnregisterRBACHTTPFilterForTesting()
 	tests := []struct {
 		name                string
 		rbacCfg             *rpb.RBAC
@@ -467,6 +480,30 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 						"certain-path": {
 							Permissions: []*v3rbacpb.Permission{
 								{Rule: &v3rbacpb.Permission_UrlPath{UrlPath: &v3matcherpb.PathMatcher{Rule: &v3matcherpb.PathMatcher_Path{Path: &v3matcherpb.StringMatcher{MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: "/grpc.testing.TestService/UnaryCall"}}}}}},
+							},
+							Principals: []*v3rbacpb.Principal{
+								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
+							},
+						},
+					},
+				},
+			},
+			wantStatusEmptyCall: codes.PermissionDenied,
+			wantStatusUnaryCall: codes.OK,
+		},
+		// This test tests an RBAC HTTP Filter which is configured to allow only
+		// RPC's with certain paths ("UnaryCall") via the ":path" header. Only
+		// unary calls passing through this RBAC HTTP Filter should proceed as
+		// normal, and any others should be denied.
+		{
+			name: "allow-certain-path-by-header",
+			rbacCfg: &rpb.RBAC{
+				Rules: &v3rbacpb.RBAC{
+					Action: v3rbacpb.RBAC_ALLOW,
+					Policies: map[string]*v3rbacpb.Policy{
+						"certain-path": {
+							Permissions: []*v3rbacpb.Permission{
+								{Rule: &v3rbacpb.Permission_Header{Header: &v3routepb.HeaderMatcher{Name: ":path", HeaderMatchSpecifier: &v3routepb.HeaderMatcher_ExactMatch{ExactMatch: "/grpc.testing.TestService/UnaryCall"}}}},
 							},
 							Principals: []*v3rbacpb.Principal{
 								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
@@ -654,9 +691,9 @@ func (s) TestRBACHTTPFilter(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				cc, err := grpc.DialContext(ctx, fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
+				cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 				if err != nil {
-					t.Fatalf("failed to dial local test server: %v", err)
+					t.Fatalf("grpc.NewClient() failed: %v", err)
 				}
 				defer cc.Close()
 
@@ -802,11 +839,24 @@ func serverListenerWithBadRouteConfiguration(t *testing.T, host string, port uin
 	}
 }
 
-func (s) TestRBACToggledOn_WithBadRouteConfiguration(t *testing.T) {
+func (s) TestRBAC_WithBadRouteConfiguration(t *testing.T) {
 	managementServer, nodeID, bootstrapContents, xdsResolver := setup.ManagementServerAndResolver(t)
+	// We need to wait for the server to enter SERVING mode before making RPCs
+	// to avoid flakes due to the server closing connections.
+	servingCh := make(chan struct{})
 
-	lis, cleanup2 := setupGRPCServer(t, bootstrapContents)
+	// Initialize a test gRPC server, assign it to the stub server, and start
+	// the test service.
+	opt := xds.ServingModeCallback(func(_ net.Addr, args xds.ServingModeChangeArgs) {
+		if args.Mode == connectivity.ServingModeServing {
+			close(servingCh)
+		}
+	})
+	lis, cleanup2 := setupGRPCServer(t, bootstrapContents, opt)
 	defer cleanup2()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 
 	host, port, err := hostPortFromListener(lis)
 	if err != nil {
@@ -829,25 +879,37 @@ func (s) TestRBACToggledOn_WithBadRouteConfiguration(t *testing.T) {
 	inboundLis := serverListenerWithBadRouteConfiguration(t, host, port)
 	resources.Listeners = append(resources.Listeners, inboundLis)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
 	// Setup the management server with client and server-side resources.
 	if err := managementServer.Update(ctx, resources); err != nil {
 		t.Fatal(err)
 	}
 
-	cc, err := grpc.DialContext(ctx, fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
+	select {
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for the xDS-enabled gRPC server to go SERVING")
+	case <-servingCh:
+	}
+
+	cc, err := grpc.NewClient(fmt.Sprintf("xds:///%s", serviceName), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(xdsResolver))
 	if err != nil {
-		t.Fatalf("failed to dial local test server: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 
 	client := testgrpc.NewTestServiceClient(cc)
-	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.Unavailable {
-		t.Fatalf("EmptyCall() returned err with status: %v, if RBAC is disabled all RPC's should proceed as normal", status.Code(err))
+	_, err = client.EmptyCall(ctx, &testpb.Empty{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("EmptyCall() returned %v, want Unavailable", err)
 	}
-	if _, err := client.UnaryCall(ctx, &testpb.SimpleRequest{}); status.Code(err) != codes.Unavailable {
-		t.Fatalf("UnaryCall() returned err with status: %v, if RBAC is disabled all RPC's should proceed as normal", status.Code(err))
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("EmptyCall() = %v, want xDS node id %q", err, nodeID)
+	}
+	_, err = client.UnaryCall(ctx, &testpb.SimpleRequest{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("UnaryCall() returned %v, want Unavailable", err)
+	}
+	if !strings.Contains(err.Error(), nodeID) {
+		t.Fatalf("UnaryCall() = %v, want xDS node id %q", err, nodeID)
 	}
 }
 
@@ -877,7 +939,7 @@ func (lb *loggerBuilder) Build(audit.LoggerConfig) audit.Logger {
 	}
 }
 
-func (*loggerBuilder) ParseLoggerConfig(config json.RawMessage) (audit.LoggerConfig, error) {
+func (*loggerBuilder) ParseLoggerConfig(json.RawMessage) (audit.LoggerConfig, error) {
 	return nil, nil
 }
 

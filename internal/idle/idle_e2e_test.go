@@ -98,19 +98,17 @@ func registerWrappedRoundRobinPolicy(t *testing.T) chan struct{} {
 	closeCh := make(chan struct{}, 1)
 	stub.Register(roundrobin.Name, stub.BalancerFuncs{
 		Init: func(bd *stub.BalancerData) {
-			bd.Data = rrBuilder.Build(bd.ClientConn, bd.BuildOptions)
+			bd.ChildBalancer = rrBuilder.Build(bd.ClientConn, bd.BuildOptions)
 		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			bal := bd.Data.(balancer.Balancer)
-			return bal.UpdateClientConnState(ccs)
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
 		},
 		Close: func(bd *stub.BalancerData) {
 			select {
 			case closeCh <- struct{}{}:
 			default:
 			}
-			bal := bd.Data.(balancer.Balancer)
-			bal.Close()
+			bd.ChildBalancer.Close()
 		},
 	})
 	t.Cleanup(func() { balancer.Register(rrBuilder) })
@@ -131,11 +129,12 @@ func (s) TestChannelIdleness_Disabled_NoActivity(t *testing.T) {
 		grpc.WithIdleTimeout(0), // Disable idleness.
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
+	cc.Connect()
 
 	// Start a test backend and push an address update via the resolver.
 	backend := stubserver.StartTestService(t, nil)
@@ -177,12 +176,13 @@ func (s) TestChannelIdleness_Enabled_NoActivity(t *testing.T) {
 		grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
 
+	cc.Connect()
 	// Start a test backend and push an address update via the resolver.
 	lis := testutils.NewListenerWrapper(t, nil)
 	backend := stubserver.StartTestService(t, &stubserver.StubServer{Listener: lis})
@@ -265,21 +265,21 @@ func (s) TestChannelIdleness_Enabled_OngoingCall(t *testing.T) {
 				grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 				grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 			}
-			cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+			cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 			if err != nil {
-				t.Fatalf("grpc.Dial() failed: %v", err)
+				t.Fatalf("grpc.NewClient() failed: %v", err)
 			}
 			defer cc.Close()
-
+			cc.Connect()
 			// Start a test backend that keeps the RPC call active by blocking
 			// on a channel that is closed by the test later on.
 			blockCh := make(chan struct{})
 			backend := &stubserver.StubServer{
-				EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+				EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
 					<-blockCh
 					return &testpb.Empty{}, nil
 				},
-				FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+				FullDuplexCallF: func(testgrpc.TestService_FullDuplexCallServer) error {
 					<-blockCh
 					return nil
 				},
@@ -354,12 +354,12 @@ func (s) TestChannelIdleness_Enabled_ActiveSinceLastCheck(t *testing.T) {
 		grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
-
+	cc.Connect()
 	// Start a test backend and push an address update via the resolver.
 	backend := stubserver.StartTestService(t, nil)
 	defer backend.Stop()
@@ -423,12 +423,12 @@ func (s) TestChannelIdleness_Enabled_ExitIdleOnRPC(t *testing.T) {
 		grpc.WithIdleTimeout(defaultTestShortIdleTimeout),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	defer cc.Close()
-
+	cc.Connect()
 	// Verify that the ClientConn moves to READY.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()

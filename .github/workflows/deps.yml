@@ -30,14 +30,31 @@ jobs:
       # Run the commands to generate dependencies before and after and compare.
       - name: Compare dependencies
         run: |
-          BEFORE="$(mktemp -d)"
-          AFTER="$(mktemp -d)"
+          set -eu
+          TEMP_DIR="$(mktemp -d)"
+          # GITHUB_BASE_REF is set when the job is triggered by a PR.
+          TARGET_REF="${GITHUB_BASE_REF:-master}"
 
-          scripts/gen-deps.sh "${AFTER}"
-          git checkout origin/master
-          scripts/gen-deps.sh "${BEFORE}"
+          mkdir "${TEMP_DIR}/after"
+          scripts/gen-deps.sh "${TEMP_DIR}/after"
 
-          echo "Comparing dependencies..."
-          # Run grep in a sub-shell since bash does not support ! in the middle of a pipe
-          diff -u0 -r "${BEFORE}" "${AFTER}" | bash -c '! grep -v "@@"'
-          echo "No changes detected."
+          git checkout "origin/${TARGET_REF}"
+          mkdir "${TEMP_DIR}/before"
+          scripts/gen-deps.sh "${TEMP_DIR}/before"
+
+          echo -e " \nComparing dependencies..."
+          cd "${TEMP_DIR}"
+          # Run grep in a sub-shell since bash does not support ! in the middle of a pipe.
+          if diff -u0 -r "before" "after" | bash -c '! grep -v "@@"'; then
+            echo "No changes detected."
+            exit 0
+          fi
+
+          # Print packages in `after` but not `before`.
+          for x in $(ls -1 after | grep -vF "$(ls -1 before)"); do
+            echo -e " \nDependencies of new package $x:"
+            cat "after/$x"
+          done
+
+          echo -e " \nChanges detected; exiting with error."
+          exit 1

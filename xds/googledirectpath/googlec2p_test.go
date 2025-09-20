@@ -19,6 +19,7 @@
 package googledirectpath
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -31,8 +32,13 @@ import (
 	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/xds/bootstrap"
+	"google.golang.org/grpc/internal/xds/xdsclient"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 	"google.golang.org/grpc/resolver"
 )
+
+const defaultTestTimeout = 5 * time.Second
 
 type s struct {
 	grpctest.Tester
@@ -97,6 +103,29 @@ func useCleanUniverseDomain(t *testing.T) {
 	})
 }
 
+// TODO(https://github.com/grpc/grpc-go/issues/8561): this content can be hardcoded directly
+// in wanted bootstraps again after old pick first is removed.
+func expectedNodeJSON(ipv6Capable bool) []byte {
+	if !envconfig.NewPickFirstEnabled && !ipv6Capable {
+		return []byte(`{
+			"id": "C2P-666",
+			"locality": {
+				"zone": "test-zone"
+			}
+		}`)
+	}
+	// Otherwise, return the node metadata including the IPv6 capability flag.
+	return []byte(`{
+		"id": "C2P-666",
+		"locality": {
+			"zone": "test-zone"
+		},
+		"metadata": {
+			"TRAFFICDIRECTOR_DIRECTPATH_C2P_IPV6_CAPABLE": true
+		}
+	}`)
+}
+
 // Tests the scenario where the bootstrap env vars are set and we're running on
 // GCE. The test builds a google-c2p resolver and verifies that an xDS resolver
 // is built and that we don't fallback to DNS (because federation is enabled by
@@ -113,6 +142,11 @@ func (s) TestBuildWithBootstrapEnvSet(t *testing.T) {
 			oldEnv := *envP
 			*envP = "does not matter"
 			defer func() { *envP = oldEnv }()
+
+			// Override xDS client pool.
+			oldXdsClientPool := xdsClientPool
+			xdsClientPool = xdsclient.NewPool(nil)
+			defer func() { xdsClientPool = oldXdsClientPool }()
 
 			// Build the google-c2p resolver.
 			r, err := builder.Build(resolver.Target{}, nil, resolver.BuildOptions{})
@@ -157,7 +191,7 @@ func bootstrapConfig(t *testing.T, opts bootstrap.ConfigOptionsForTesting) *boot
 	if err != nil {
 		t.Fatalf("Failed to create bootstrap contents: %v", err)
 	}
-	cfg, err := bootstrap.NewConfigForTesting(contents)
+	cfg, err := bootstrap.NewConfigFromContents(contents)
 	if err != nil {
 		t.Fatalf("Failed to create bootstrap config: %v", err)
 	}
@@ -207,10 +241,7 @@ func (s) TestBuildXDS(t *testing.T) {
 							]
 						}`),
 				},
-				Node: []byte(`{
-					  "id": "C2P-666",
-					  "locality": {"zone": "test-zone"}
-					}`),
+				Node: expectedNodeJSON(false),
 			}),
 		},
 		{
@@ -233,13 +264,7 @@ func (s) TestBuildXDS(t *testing.T) {
 							]
 						}`),
 				},
-				Node: []byte(`{
-					  "id": "C2P-666",
-					  "locality": {"zone": "test-zone"},
-			  			"metadata": {
-							"TRAFFICDIRECTOR_DIRECTPATH_C2P_IPV6_CAPABLE": true
-			  			}
-					}`),
+				Node: expectedNodeJSON(true),
 			}),
 		},
 		{
@@ -263,13 +288,7 @@ func (s) TestBuildXDS(t *testing.T) {
 							]
 						}`),
 				},
-				Node: []byte(`{
-					  "id": "C2P-666",
-					  "locality": {"zone": "test-zone"},
-			  			"metadata": {
-							"TRAFFICDIRECTOR_DIRECTPATH_C2P_IPV6_CAPABLE": true
-			  			}
-					}`),
+				Node: expectedNodeJSON(true),
 			}),
 		},
 	} {
@@ -286,6 +305,14 @@ func (s) TestBuildXDS(t *testing.T) {
 				defer func() { envconfig.C2PResolverTestOnlyTrafficDirectorURI = oldURI }()
 			}
 
+			// Override xDS client pool.
+			oldXdsClientPool := xdsClientPool
+			xdsClientPool = xdsclient.NewPool(nil)
+			defer func() { xdsClientPool = oldXdsClientPool }()
+
+			getIPv6Capable = func(time.Duration) bool { return tt.ipv6Capable }
+			defer func() { getIPv6Capable = oldGetIPv6Capability }()
+
 			// Build the google-c2p resolver.
 			r, err := builder.Build(resolver.Target{}, nil, resolver.BuildOptions{})
 			if err != nil {
@@ -298,8 +325,8 @@ func (s) TestBuildXDS(t *testing.T) {
 				t.Fatalf("Build() returned %#v, want xds resolver", r)
 			}
 
-			gotConfig, err := bootstrap.GetConfiguration()
-			if err != nil {
+			gotConfig := xdsClientPool.BootstrapConfigForTesting()
+			if gotConfig == nil {
 				t.Fatalf("Failed to get bootstrap config: %v", err)
 			}
 			if diff := cmp.Diff(tt.wantBootstrapConfig, gotConfig); diff != "" {
@@ -315,15 +342,22 @@ func (s) TestBuildXDS(t *testing.T) {
 func (s) TestBuildFailsWhenCalledWithAuthority(t *testing.T) {
 	useCleanUniverseDomain(t)
 	uri := "google-c2p://an-authority/resource"
-	cc, err := grpc.Dial(uri, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(uri, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create a client for server: %v", err)
+	}
 	defer func() {
 		if cc != nil {
 			cc.Close()
 		}
 	}()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	client := testgrpc.NewTestServiceClient(cc)
+	_, err = client.EmptyCall(ctx, &testpb.Empty{})
 	wantErr := "google-c2p URI scheme does not support authorities"
 	if err == nil || !strings.Contains(err.Error(), wantErr) {
-		t.Fatalf("grpc.Dial(%s) returned error: %v, want: %v", uri, err, wantErr)
+		t.Fatalf("client.EmptyCall(%s) returned error: %v, want: %v", uri, err, wantErr)
 	}
 }
 
@@ -375,6 +409,11 @@ func (s) TestSetUniverseDomainNonDefault(t *testing.T) {
 		t.Fatalf("googlec2p.SetUniverseDomain(%s) failed: %v", testUniverseDomain, err)
 	}
 
+	// Override xDS client pool.
+	oldXdsClientPool := xdsClientPool
+	xdsClientPool = xdsclient.NewPool(nil)
+	defer func() { xdsClientPool = oldXdsClientPool }()
+
 	// Build the google-c2p resolver.
 	r, err := builder.Build(resolver.Target{}, nil, resolver.BuildOptions{})
 	if err != nil {
@@ -387,8 +426,8 @@ func (s) TestSetUniverseDomainNonDefault(t *testing.T) {
 		t.Fatalf("Build() returned %#v, want xds resolver", r)
 	}
 
-	gotConfig, err := bootstrap.GetConfiguration()
-	if err != nil {
+	gotConfig := xdsClientPool.BootstrapConfigForTesting()
+	if gotConfig == nil {
 		t.Fatalf("Failed to get bootstrap config: %v", err)
 	}
 
@@ -411,10 +450,7 @@ func (s) TestSetUniverseDomainNonDefault(t *testing.T) {
 							]
 						}`),
 		},
-		Node: []byte(`{
-					  "id": "C2P-666",
-					  "locality": {"zone": "test-zone"}
-					}`),
+		Node: expectedNodeJSON(false),
 	})
 	if diff := cmp.Diff(wantBootstrapConfig, gotConfig); diff != "" {
 		t.Fatalf("Unexpected diff in bootstrap config (-want +got):\n%s", diff)
@@ -442,6 +478,11 @@ func (s) TestDefaultUniverseDomain(t *testing.T) {
 	randInt = func() int { return 666 }
 	defer func() { randInt = origRandInd }()
 
+	// Override xDS client pool.
+	oldXdsClientPool := xdsClientPool
+	xdsClientPool = xdsclient.NewPool(nil)
+	defer func() { xdsClientPool = oldXdsClientPool }()
+
 	// Build the google-c2p resolver.
 	r, err := builder.Build(resolver.Target{}, nil, resolver.BuildOptions{})
 	if err != nil {
@@ -454,8 +495,8 @@ func (s) TestDefaultUniverseDomain(t *testing.T) {
 		t.Fatalf("Build() returned %#v, want xds resolver", r)
 	}
 
-	gotConfig, err := bootstrap.GetConfiguration()
-	if err != nil {
+	gotConfig := xdsClientPool.BootstrapConfigForTesting()
+	if gotConfig == nil {
 		t.Fatalf("Failed to get bootstrap config: %v", err)
 	}
 
@@ -477,10 +518,7 @@ func (s) TestDefaultUniverseDomain(t *testing.T) {
 							]
 						}`),
 		},
-		Node: []byte(`{
-					  "id": "C2P-666",
-					  "locality": {"zone": "test-zone"}
-					}`),
+		Node: expectedNodeJSON(false),
 	})
 	if diff := cmp.Diff(wantBootstrapConfig, gotConfig); diff != "" {
 		t.Fatalf("Unexpected diff in bootstrap config (-want +got):\n%s", diff)

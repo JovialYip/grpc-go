@@ -86,9 +86,7 @@ func (greeterServer) SayHello(_ context.Context, in *pb.HelloRequest) (*pb.Hello
 
 // TODO(ZhenLian): remove shouldFail to the function signature to provider
 // tests.
-func callAndVerify(msg string, client pb.GreeterClient, shouldFail bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+func callAndVerify(ctx context.Context, msg string, client pb.GreeterClient, shouldFail bool) error {
 	_, err := client.SayHello(ctx, &pb.HelloRequest{Name: msg})
 	if want, got := shouldFail == true, err != nil; got != want {
 		return fmt.Errorf("want and got mismatch,  want shouldFail=%v, got fail=%v, rpc error: %v", want, got, err)
@@ -98,24 +96,15 @@ func callAndVerify(msg string, client pb.GreeterClient, shouldFail bool) error {
 
 // TODO(ZhenLian): remove shouldFail and add ...DialOption to the function
 // signature to provider cleaner tests.
-func callAndVerifyWithClientConn(connCtx context.Context, address string, msg string, creds credentials.TransportCredentials, shouldFail bool) (*grpc.ClientConn, pb.GreeterClient, error) {
-	var conn *grpc.ClientConn
-	var err error
-	// If we want the test to fail, we establish a non-blocking connection to
-	// avoid it hangs and killed by the context.
-	if shouldFail {
-		conn, err = grpc.DialContext(connCtx, address, grpc.WithTransportCredentials(creds))
-		if err != nil {
-			return nil, nil, fmt.Errorf("client failed to connect to %s. Error: %v", address, err)
-		}
-	} else {
-		conn, err = grpc.DialContext(connCtx, address, grpc.WithTransportCredentials(creds), grpc.WithBlock())
-		if err != nil {
-			return nil, nil, fmt.Errorf("client failed to connect to %s. Error: %v", address, err)
-		}
+func callAndVerifyWithClientConn(ctx context.Context, address string, msg string, creds credentials.TransportCredentials, shouldFail bool) (*grpc.ClientConn, pb.GreeterClient, error) {
+	// Disable service config lookups as it results in a DNS lookup which can
+	// flake in CI.
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(creds), grpc.WithDisableServiceConfig())
+	if err != nil {
+		return nil, nil, fmt.Errorf("client failed to connect to %s. Error: %v", address, err)
 	}
 	greetClient := pb.NewGreeterClient(conn)
-	err = callAndVerify(msg, greetClient, shouldFail)
+	err = callAndVerify(ctx, msg, greetClient, shouldFail)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -264,7 +253,7 @@ func (s) TestEnd2End(t *testing.T) {
 				}
 				cert, err := x509.ParseCertificate(params.RawCerts[0])
 				if err != nil || cert == nil {
-					return nil, fmt.Errorf("failed to parse certificate: " + err.Error())
+					return nil, fmt.Errorf("failed to parse certificate: %v", err)
 				}
 				authzCheck := false
 				switch stage.read() {
@@ -392,7 +381,7 @@ func (s) TestEnd2End(t *testing.T) {
 			stage.increase()
 			// ------------------------Scenario 2------------------------------------
 			// stage = 1, previous connection should still succeed
-			err = callAndVerify("rpc call 2", greetClient, false)
+			err = callAndVerify(ctx, "rpc call 2", greetClient, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -684,7 +673,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			test.certUpdateFunc()
 			time.Sleep(sleepInterval)
 			// The already-established connection should not be affected.
-			err = callAndVerify("rpc call 2", greetClient, false)
+			err = callAndVerify(ctx, "rpc call 2", greetClient, false)
 			if err != nil {
 				t.Fatal(err)
 			}

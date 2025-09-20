@@ -35,9 +35,10 @@ import (
 	"google.golang.org/grpc/internal/pretty"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+	"google.golang.org/grpc/internal/xds/bootstrap"
+	"google.golang.org/grpc/internal/xds/xdsclient"
+	"google.golang.org/grpc/internal/xds/xdsclient/xdsresource"
 	"google.golang.org/grpc/xds/csds"
-	"google.golang.org/grpc/xds/internal/xdsclient"
-	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -51,7 +52,7 @@ import (
 	v3statuspb "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
 	v3statuspbgrpc "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
 
-	_ "google.golang.org/grpc/xds/internal/httpfilter/router" // Register the router filter
+	_ "google.golang.org/grpc/internal/xds/httpfilter/router" // Register the router filter
 )
 
 const defaultTestTimeout = 5 * time.Second
@@ -70,49 +71,49 @@ func Test(t *testing.T) {
 
 type nopListenerWatcher struct{}
 
-func (nopListenerWatcher) OnUpdate(_ *xdsresource.ListenerResourceData, onDone xdsresource.OnDoneFunc) {
+func (nopListenerWatcher) ResourceChanged(_ *xdsresource.ListenerResourceData, onDone func()) {
 	onDone()
 }
-func (nopListenerWatcher) OnError(_ error, onDone xdsresource.OnDoneFunc) {
+func (nopListenerWatcher) ResourceError(_ error, onDone func()) {
 	onDone()
 }
-func (nopListenerWatcher) OnResourceDoesNotExist(onDone xdsresource.OnDoneFunc) {
+func (nopListenerWatcher) AmbientError(_ error, onDone func()) {
 	onDone()
 }
 
 type nopRouteConfigWatcher struct{}
 
-func (nopRouteConfigWatcher) OnUpdate(_ *xdsresource.RouteConfigResourceData, onDone xdsresource.OnDoneFunc) {
+func (nopRouteConfigWatcher) ResourceChanged(_ *xdsresource.RouteConfigResourceData, onDone func()) {
 	onDone()
 }
-func (nopRouteConfigWatcher) OnError(_ error, onDone xdsresource.OnDoneFunc) {
+func (nopRouteConfigWatcher) ResourceError(_ error, onDone func()) {
 	onDone()
 }
-func (nopRouteConfigWatcher) OnResourceDoesNotExist(onDone xdsresource.OnDoneFunc) {
+func (nopRouteConfigWatcher) AmbientError(_ error, onDone func()) {
 	onDone()
 }
 
 type nopClusterWatcher struct{}
 
-func (nopClusterWatcher) OnUpdate(_ *xdsresource.ClusterResourceData, onDone xdsresource.OnDoneFunc) {
+func (nopClusterWatcher) ResourceChanged(_ *xdsresource.ClusterResourceData, onDone func()) {
 	onDone()
 }
-func (nopClusterWatcher) OnError(_ error, onDone xdsresource.OnDoneFunc) {
+func (nopClusterWatcher) ResourceError(_ error, onDone func()) {
 	onDone()
 }
-func (nopClusterWatcher) OnResourceDoesNotExist(onDone xdsresource.OnDoneFunc) {
+func (nopClusterWatcher) AmbientError(_ error, onDone func()) {
 	onDone()
 }
 
 type nopEndpointsWatcher struct{}
 
-func (nopEndpointsWatcher) OnUpdate(_ *xdsresource.EndpointsResourceData, onDone xdsresource.OnDoneFunc) {
+func (nopEndpointsWatcher) ResourceChanged(_ *xdsresource.EndpointsResourceData, onDone func()) {
 	onDone()
 }
-func (nopEndpointsWatcher) OnError(_ error, onDone xdsresource.OnDoneFunc) {
+func (nopEndpointsWatcher) ResourceError(_ error, onDone func()) {
 	onDone()
 }
-func (nopEndpointsWatcher) OnResourceDoesNotExist(onDone xdsresource.OnDoneFunc) {
+func (nopEndpointsWatcher) AmbientError(_ error, onDone func()) {
 	onDone()
 }
 
@@ -126,31 +127,31 @@ func (nopEndpointsWatcher) OnResourceDoesNotExist(onDone xdsresource.OnDoneFunc)
 // for ADS stream level flow control), and was causing CSDS to not receive any
 // updates from the xDS client.
 type blockingListenerWatcher struct {
-	testCtxDone <-chan struct{}             // Closed when the test is done.
-	onDoneCh    chan xdsresource.OnDoneFunc // Channel to write the onDone callback to.
+	testCtxDone <-chan struct{} // Closed when the test is done.
+	onDoneCh    chan func()     // Channel to write the onDone callback to.
 }
 
 func newBlockingListenerWatcher(testCtxDone <-chan struct{}) *blockingListenerWatcher {
 	return &blockingListenerWatcher{
 		testCtxDone: testCtxDone,
-		onDoneCh:    make(chan xdsresource.OnDoneFunc, 1),
+		onDoneCh:    make(chan func(), 1),
 	}
 }
 
-func (w *blockingListenerWatcher) OnUpdate(_ *xdsresource.ListenerResourceData, onDone xdsresource.OnDoneFunc) {
+func (w *blockingListenerWatcher) ResourceChanged(_ *xdsresource.ListenerResourceData, onDone func()) {
 	writeOnDone(w.testCtxDone, w.onDoneCh, onDone)
 }
-func (w *blockingListenerWatcher) OnError(_ error, onDone xdsresource.OnDoneFunc) {
+func (w *blockingListenerWatcher) ResourceError(_ error, onDone func()) {
 	writeOnDone(w.testCtxDone, w.onDoneCh, onDone)
 }
-func (w *blockingListenerWatcher) OnResourceDoesNotExist(onDone xdsresource.OnDoneFunc) {
+func (w *blockingListenerWatcher) AmbientError(_ error, onDone func()) {
 	writeOnDone(w.testCtxDone, w.onDoneCh, onDone)
 }
 
 // writeOnDone attempts to write the onDone callback on the onDone channel. It
 // returns when it can successfully write to the channel or when the test is
 // done, which is signalled by testCtxDone being closed.
-func writeOnDone(testCtxDone <-chan struct{}, onDoneCh chan xdsresource.OnDoneFunc, onDone xdsresource.OnDoneFunc) {
+func writeOnDone(testCtxDone <-chan struct{}, onDoneCh chan func(), onDone func()) {
 	select {
 	case <-testCtxDone:
 	case onDoneCh <- onDone:
@@ -220,22 +221,28 @@ func (s) TestCSDS(t *testing.T) {
 	// Create a bootstrap contents pointing to the above management server.
 	nodeID := uuid.New().String()
 	bootstrapContents := e2e.DefaultBootstrapContents(t, nodeID, mgmtServer.Address)
-
+	config, err := bootstrap.NewConfigFromContents(bootstrapContents)
+	if err != nil {
+		t.Fatalf("Failed to parse bootstrap contents: %s, %v", string(bootstrapContents), err)
+	}
+	// We use the default xDS client pool here because the CSDS service reports
+	// on the state of the default xDS client which is implicitly managed
+	// within the xdsclient.DefaultPool.
+	xdsclient.DefaultPool.SetFallbackBootstrapConfig(config)
+	defer func() { xdsclient.DefaultPool.UnsetBootstrapConfigForTesting() }()
 	// Create two xDS clients, with different names. These should end up
 	// creating two different xDS clients.
 	const xdsClient1Name = "xds-csds-client-1"
-	xdsClient1, xdsClose1, err := xdsclient.NewForTesting(xdsclient.OptionsForTesting{
-		Name:     xdsClient1Name,
-		Contents: bootstrapContents,
+	xdsClient1, xdsClose1, err := xdsclient.DefaultPool.NewClientForTesting(xdsclient.OptionsForTesting{
+		Name: xdsClient1Name,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create xDS client: %v", err)
 	}
 	defer xdsClose1()
 	const xdsClient2Name = "xds-csds-client-2"
-	xdsClient2, xdsClose2, err := xdsclient.NewForTesting(xdsclient.OptionsForTesting{
-		Name:     xdsClient2Name,
-		Contents: bootstrapContents,
+	xdsClient2, xdsClose2, err := xdsclient.DefaultPool.NewClientForTesting(xdsclient.OptionsForTesting{
+		Name: xdsClient2Name,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create xDS client: %v", err)
@@ -417,22 +424,28 @@ func (s) TestCSDS_NACK(t *testing.T) {
 	// Create a bootstrap contents pointing to the above management server.
 	nodeID := uuid.New().String()
 	bootstrapContents := e2e.DefaultBootstrapContents(t, nodeID, mgmtServer.Address)
-
+	config, err := bootstrap.NewConfigFromContents(bootstrapContents)
+	if err != nil {
+		t.Fatalf("Failed to parse bootstrap contents: %s, %v", string(bootstrapContents), err)
+	}
+	// We use the default xDS client pool here because the CSDS service reports
+	// on the state of the default xDS client which is implicitly managed
+	// within the xdsclient.DefaultPool.
+	xdsclient.DefaultPool.SetFallbackBootstrapConfig(config)
+	defer func() { xdsclient.DefaultPool.UnsetBootstrapConfigForTesting() }()
 	// Create two xDS clients, with different names. These should end up
 	// creating two different xDS clients.
 	const xdsClient1Name = "xds-csds-client-1"
-	xdsClient1, xdsClose1, err := xdsclient.NewForTesting(xdsclient.OptionsForTesting{
-		Name:     xdsClient1Name,
-		Contents: bootstrapContents,
+	xdsClient1, xdsClose1, err := xdsclient.DefaultPool.NewClientForTesting(xdsclient.OptionsForTesting{
+		Name: xdsClient1Name,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create xDS client: %v", err)
 	}
 	defer xdsClose1()
 	const xdsClient2Name = "xds-csds-client-2"
-	xdsClient2, xdsClose2, err := xdsclient.NewForTesting(xdsclient.OptionsForTesting{
-		Name:     xdsClient2Name,
-		Contents: bootstrapContents,
+	xdsClient2, xdsClose2, err := xdsclient.DefaultPool.NewClientForTesting(xdsclient.OptionsForTesting{
+		Name: xdsClient2Name,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create xDS client: %v", err)

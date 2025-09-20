@@ -49,13 +49,36 @@ func ManagementServerAndResolver(t *testing.T) (*e2e.ManagementServer, string, [
 	bc := e2e.DefaultBootstrapContents(t, nodeID, xdsServer.Address)
 
 	// Create an xDS resolver with the above bootstrap configuration.
-	var r resolver.Builder
-	var err error
-	if newResolver := internal.NewXDSResolverWithConfigForTesting; newResolver != nil {
-		r, err = newResolver.(func([]byte) (resolver.Builder, error))(bc)
-		if err != nil {
-			t.Fatalf("Failed to create xDS resolver for testing: %v", err)
-		}
+	if internal.NewXDSResolverWithConfigForTesting == nil {
+		t.Fatalf("internal.NewXDSResolverWithConfigForTesting is nil")
+	}
+	r, err := internal.NewXDSResolverWithConfigForTesting.(func([]byte) (resolver.Builder, error))(bc)
+	if err != nil {
+		t.Fatalf("Failed to create xDS resolver for testing: %v", err)
+	}
+
+	return xdsServer, nodeID, bc, r
+}
+
+// ManagementServerAndResolverWithSPIFFE is exactly the same as
+// ManagementServerAndResolver, except that it uses a bootstrap configuration
+// containing certificate providers utilizing SPIFFE test certificates.
+func ManagementServerAndResolverWithSPIFFE(t *testing.T) (*e2e.ManagementServer,
+	string, []byte, resolver.Builder) {
+	// Start an xDS management server.
+	xdsServer := e2e.StartManagementServer(t, e2e.ManagementServerOptions{AllowResourceSubset: true})
+
+	// Create bootstrap configuration pointing to the above management server.
+	nodeID := uuid.New().String()
+	bc := e2e.SPIFFEBootstrapContents(t, nodeID, xdsServer.Address)
+
+	// Create an xDS resolver with the above bootstrap configuration.
+	if internal.NewXDSResolverWithConfigForTesting == nil {
+		t.Fatalf("internal.NewXDSResolverWithConfigForTesting is nil")
+	}
+	r, err := internal.NewXDSResolverWithConfigForTesting.(func([]byte) (resolver.Builder, error))(bc)
+	if err != nil {
+		t.Fatalf("Failed to create xDS resolver for testing: %v", err)
 	}
 
 	return xdsServer, nodeID, bc, r

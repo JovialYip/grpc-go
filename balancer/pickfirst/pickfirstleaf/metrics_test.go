@@ -65,7 +65,7 @@ func (s) TestPickFirstMetrics(t *testing.T) {
 	defer cancel()
 
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
 			return &testpb.Empty{}, nil
 		},
 	}
@@ -155,7 +155,7 @@ func (s) TestPickFirstMetricsE2E(t *testing.T) {
 	defer cancel()
 
 	ss := &stubserver.StubServer{
-		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+		EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
 			return &testpb.Empty{}, nil
 		},
 	}
@@ -204,7 +204,7 @@ func (s) TestPickFirstMetricsE2E(t *testing.T) {
 		{
 			Name:        "grpc.lb.pick_first.connection_attempts_succeeded",
 			Description: "EXPERIMENTAL. Number of successful connection attempts.",
-			Unit:        "attempt",
+			Unit:        "{attempt}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -219,7 +219,7 @@ func (s) TestPickFirstMetricsE2E(t *testing.T) {
 		{
 			Name:        "grpc.lb.pick_first.connection_attempts_failed",
 			Description: "EXPERIMENTAL. Number of failed connection attempts.",
-			Unit:        "attempt",
+			Unit:        "{attempt}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
@@ -234,7 +234,7 @@ func (s) TestPickFirstMetricsE2E(t *testing.T) {
 		{
 			Name:        "grpc.lb.pick_first.disconnections",
 			Description: "EXPERIMENTAL. Number of times the selected subchannel becomes disconnected.",
-			Unit:        "disconnection",
+			Unit:        "{disconnection}",
 			Data: metricdata.Sum[int64]{
 				DataPoints: []metricdata.DataPoint[int64]{
 					{
